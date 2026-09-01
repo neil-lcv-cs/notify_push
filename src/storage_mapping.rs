@@ -10,9 +10,9 @@ use ahash::RandomState;
 use dashmap::mapref::one::Ref;
 use dashmap::DashMap;
 use log::debug;
-use rand::{thread_rng, Rng};
+use rand::{rng, RngExt};
 use sqlx::any::AnyConnectOptions;
-use sqlx::{query_as, Any, AnyPool, FromRow};
+use sqlx::{Any, AnyPool, FromRow, QueryBuilder};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 use tokio::time::Duration;
@@ -33,11 +33,11 @@ struct CachedAccess {
 
 impl CachedAccess {
     pub fn new(access: Vec<UserStorageAccess>) -> Self {
-        let mut rng = thread_rng();
+        let mut rng = rng();
         Self {
             access,
             valid_till: Instant::now()
-                + Duration::from_millis(rng.gen_range((4 * 60 * 1000)..(5 * 60 * 1000))),
+                + Duration::from_millis(rng.random_range((4 * 60 * 1000)..(5 * 60 * 1000))),
             updating: AtomicBool::new(false),
         }
     }
@@ -78,24 +78,28 @@ impl StorageMapping {
         &self,
         storage: u32,
     ) -> Result<Ref<'_, u32, CachedAccess>, DatabaseError> {
+        // Note: the `Ref` handed out by `DashMap::get` is a read guard on the map shard, and
+        // taking the write lock for `insert` blocks the calling *thread*, not just the task.
+        // Holding the guard across the `.await` below therefore parks any runtime worker that
+        // tries to insert into the same shard while this query is in flight; if that starves
+        // the runtime, nothing polls the reactor, the query never completes and the guard is
+        // never released. Keep every guard in this function strictly await-free.
         if let Some(cached) = self.cache.get(&storage) {
             if cached.is_valid() {
                 return Ok(cached);
             }
 
             cached.prepare_update(true);
-            let users = self
-                .load_storage_mapping(storage)
-                .await
-                .inspect_err(|_| cached.prepare_update(false))?;
-
-            drop(cached);
-            let cached = CachedAccess::new(users);
-            self.cache.insert(storage, cached);
-            return Ok(self.cache.get(&storage).unwrap());
         }
 
-        let users = self.load_storage_mapping(storage).await?;
+        let users = self
+            .load_storage_mapping(storage)
+            .await
+            .inspect_err(|_| {
+                if let Some(cached) = self.cache.get(&storage) {
+                    cached.prepare_update(false);
+                }
+            })?;
 
         self.cache.insert(storage, CachedAccess::new(users));
         Ok(self.cache.get(&storage).unwrap())
@@ -126,18 +130,21 @@ impl StorageMapping {
         storage: u32,
     ) -> Result<Vec<UserStorageAccess>, DatabaseError> {
         debug!("querying storage mapping for {storage}");
-        let users = query_as::<Any, UserStorageAccess>(&format!(
-            "\
-                SELECT user_id, path \
-                FROM {prefix}mounts \
-                INNER JOIN {prefix}filecache ON root_id = fileid \
-                WHERE storage_id = {storage}",
-            prefix = self.prefix,
-            storage = storage
-        ))
-        .fetch_all(&self.connection)
-        .await
-        .map_err(DatabaseError::Query)?;
+        let mut builder: QueryBuilder<Any> = QueryBuilder::new("SELECT user_id, path ");
+        // SQL safety: `self.prefix` is admin provided and thus trusted
+        builder.push(format_args!(
+            "FROM {prefix}mounts INNER JOIN {prefix}filecache ON root_id = fileid ",
+            prefix = self.prefix
+        ));
+        builder.push("WHERE storage_id = ");
+        // https://github.com/transact-rs/sqlx/issues/3000 prevents us from using `push_bind`
+        // SQL safety: `storage` is an integer and thus safe from sql injections
+        builder.push(format_args!("{}", storage));
+        let users = builder
+            .build_query_as::<UserStorageAccess>()
+            .fetch_all(&self.connection)
+            .await
+            .map_err(DatabaseError::Query)?;
         METRICS.add_mapping_query();
 
         debug!("got storage mappings for {storage}: {users:?}");
